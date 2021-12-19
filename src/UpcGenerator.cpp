@@ -46,13 +46,26 @@ UpcGenerator::UpcGenerator()
   // get parameters from file
   initGeneratorFromFile();
 
-  mLep = lepMassMap[lepPDG];
+  auto lepton = lepMassMap.find(lepPDG);
+  if (lepton != lepMassMap.end()) {
+    mLep = lepMassMap[lepPDG];
+  } else {
+    PLOG_WARNING << "Incorrect PDG! Aborting calculation...";
+    exit(-1);
+  }
+
+  // update gamma factors
+  g1 = sqrts / (2. * mProt);
+  g2 = sqrts / (2. * mProt);
 
   // update scaling factor
   factor = Z * Z * alpha / M_PI / M_PI / hc / hc;
 
   // calculate Woods-Saxon rho0 from R and a
   rho0 = calcWSRho();
+
+  // calculate mass of the nucleus
+  mN = mProt * Z + (A - Z) * mNeut;
 
   // initialize the MT64 random number generator
   gRandom = new TRandomMT64();
@@ -101,8 +114,6 @@ void UpcGenerator::initGeneratorFromFile()
       }
       if (parameter == parDict.inCMSqrtS) {
         sqrts = stod(parValue);
-        g1 = sqrts / (2. * mProt);
-        g2 = sqrts / (2. * mProt);
       }
       if (parameter == parDict.inLepPDG) {
         lepPDG = stoi(parValue);
@@ -170,6 +181,9 @@ void UpcGenerator::initGeneratorFromFile()
       if (parameter == parDict.inNonzeroGamPt) {
         useNonzeroGamPt = stoi(parValue);
       }
+      if (parameter == parDict.inCalcScreened) {
+        doScreened = stoi(parValue);
+      }
       if (parameter == parDict.inSeed) {
         seed = stol(parValue);
       }
@@ -206,6 +220,7 @@ void UpcGenerator::printParameters()
   PLOG_WARNING << "BINS_Y " << ny;
   PLOG_WARNING << "FLUX_POINT " << isPoint;
   PLOG_WARNING << "NON_ZERO_GAM_PT " << useNonzeroGamPt;
+  PLOG_WARNING << "DO_SCREENED " << doScreened;
   PLOG_WARNING << "PYTHIA_VERSION " << pythiaVersion;
   PLOG_WARNING << "PYTHIA8_FSR " << doFSR;
   PLOG_WARNING << "PYTHIA8_DECAYS " << doDecays;
@@ -288,7 +303,7 @@ void UpcGenerator::writeEvent(int evt,
 #endif
 }
 
-double UpcGenerator::simpson(int n, double* v, double h)
+double UpcGenerator::simpson(int n, const double* v, double h)
 {
   double sum = v[0] + v[n - 1];
   for (int i = 1; i < n - 1; i += 2) {
@@ -308,6 +323,214 @@ double UpcGenerator::calcWSRho()
   }
   double wsRho0 = A / simpson(nb, vRho, db) / 4 / M_PI;
   return wsRho0;
+}
+
+// polarized amplitudes
+void UpcGenerator::calcAmplitudes(double s, double z,
+                                  valarray<double>& amplitudes)
+{
+  double k = TMath::Sqrt(s / 2.);                     // photon/lepton energy in cm system in GeV
+  double p = TMath::Sqrt(k * k - mLep * mLep);        // outgoing lepton momentum in GeV
+  double beta = TMath::Sqrt(1 - 4 * mLep * mLep / s); // lepton relativistic velocity in cms
+  double kt = -2 * k * (k - z * p) / mLep / mLep;
+  double ku = -2 * k * (k + z * p) / mLep / mLep;
+  double s2 = s * s;
+  double m2kt = kt * mLep * mLep; // = -2 p1.p3 = -2 p2.p4
+  double m2ku = ku * mLep * mLep; // = -2 p1.p4 = -2 p2.p3
+  // amplitudes for ++ leptons and different photon polarizations
+  double ppnncom = mLep / sqrt(s) * s2 / m2kt / m2ku;
+  double pospos = ppnncom * (1 + beta);
+  double negneg = ppnncom * (-1 + beta);
+  double posneg = 4 * mLep / sqrt(s) * beta * (1 - z * z) / (1 - beta * beta * z * z);
+  double negpos = posneg;
+  amplitudes[0] = pospos;
+  amplitudes[1] = negneg;
+  amplitudes[2] = posneg;
+  amplitudes[3] = negpos;
+  // amplitudes for -- leptons and different photon polarizations
+  amplitudes[4] = pospos;
+  amplitudes[5] = negneg;
+  amplitudes[6] = -posneg;
+  amplitudes[7] = -negpos;
+  // amplitudes for +- leptons and different photon polarizations
+  double pncom = -2 * beta * sqrt(1 - z * z) / (1 - beta * beta * z * z);
+  posneg = pncom * (1 - z);
+  negpos = pncom * (1 + z);
+  amplitudes[8] = 0;
+  amplitudes[9] = 0;
+  amplitudes[10] = posneg;
+  amplitudes[11] = negpos;
+  // amplitudes for -+ leptons and different photon polarizations
+  amplitudes[12] = 0;
+  amplitudes[13] = 0;
+  amplitudes[14] = negpos;
+  amplitudes[15] = posneg;
+  // dim-less //
+}
+
+// sum of photon helicity amplitudes for a given lepton pair state
+// 0 -> ++, 1 -> --, 2 -> +-, 3 -> -+
+complex<double> UpcGenerator::calcSpinAmplitudes(double s, double z, int spState,
+                                                 double qt1xPr, double qt1yPr,
+                                                 double qt2xPr, double qt2yPr)
+{
+  valarray<double> helicityAmps(16);
+  calcAmplitudes(s, z, helicityAmps);
+  double dotProd = qt1xPr * qt2xPr + qt1yPr * qt2yPr;
+  double vecProd = qt1xPr * qt2yPr - qt2xPr * qt1yPr;
+  double dotAProd = qt1xPr * qt2xPr - qt1yPr * qt2yPr;
+  double vecAProd = qt1xPr * qt2yPr + qt2xPr * qt1yPr;
+  complex<double> sum;
+  double pospos = helicityAmps[0 + spState * 4];
+  double negneg = helicityAmps[1 + spState * 4];
+  double posneg = helicityAmps[2 + spState * 4];
+  double negpos = helicityAmps[3 + spState * 4];
+  complex<double> amps = -(pospos + negneg) * dotProd - 1i * (pospos - negneg) * vecProd + (dotAProd + 1i * vecAProd) * negpos + (dotAProd - 1i * vecAProd) * posneg;
+  sum += amps;
+  return sum * 0.5;
+  // GeV^2 //
+}
+
+double UpcGenerator::calcGAATransform(double kt)
+{
+  auto* values = new double[nb];
+  for (int i = 0; i < nb; i++) {
+    double b = db * i;
+    values[i] = b * TMath::BesselJ0(kt * b / hc) * (1 - vGAA[i]);
+  }
+  double tfGAA = 2 * M_PI * simpson(nb, values, db);
+  delete[] values;
+  return tfGAA;
+  // fm^2 //
+}
+
+double UpcGenerator::calcNormFF(double x, double qtxPr, double qtyPr)
+{
+  double qtPrSq = qtxPr * qtxPr + qtyPr * qtyPr;
+  double Qsq = (qtPrSq + x * x * mN * mN) / (1 - x);
+  double Q = sqrt(Qsq) / hc; // we need dim-less form factor
+  double sinhVal = TMath::SinH(M_PI * Q * a);
+  double coshVal = TMath::CosH(M_PI * Q * a);
+  double ffWS = 4 * M_PI * M_PI * rho0 * a * a * a / (Q * a * Q * a * sinhVal * sinhVal) *
+                (M_PI * Q * a * coshVal * TMath::Sin(Q * R) - Q * R * TMath::Cos(Q * R) * sinhVal);
+  ffWS += 8 * M_PI * rho0 * a * a * a * exp(-R / a) / (Q * Q * a * a) / (Q * Q * a * a);
+  double ff = sqrt(alpha / M_PI / x * (1 - x)) * ffWS / (qtPrSq + x * x * mN * mN);
+  return ff;
+  // GeV^-2 //
+}
+
+void UpcGenerator::calcScreenedAmp(double s, double z, double x1, double x2,
+                                   double kt1x, double kt1y,
+                                   double kt2x, double kt2y,
+                                   valarray<complex<double>>& spAmplitudes)
+{
+  const int nqt = 200;
+  const int nphi = 8;
+  const double qtmin = 1e-4; // GeV
+  const double qtmax = 1;    // GeV
+  double log_delta_qt = (log(qtmax) - log(qtmin)) / nqt;
+  valarray<complex<double>> sum(4);
+  valarray<complex<double>> sum_phi(4);
+  for (int iqt = 0; iqt < nqt; iqt++) {
+    double qtl = qtmin * exp(iqt * log_delta_qt);
+    double qth = qtmin * exp((iqt + 1) * log_delta_qt);
+    double qt = (qth + qtl) / 2;
+    double tfGAA = calcGAATransform(qt); // fm^2
+    for (int iphi = 0; iphi < nphi; iphi++) {
+      double phi = 2 * M_PI * (abscissas8[iphi] + 1); // integrating from 0 to 2pi
+      double qtx = qt * cos(phi);
+      double qty = qt * sin(phi);
+      double qt1xPr = kt1x - qtx;
+      double qt1yPr = kt1y - qty;
+      double qt2xPr = kt2x + qtx;
+      double qt2yPr = kt2y + qty;
+      for (int spState = 0; spState < 3; spState++) {
+        complex<double> amps = calcSpinAmplitudes(s, z, spState, qt1xPr, qt1yPr, qt2xPr, qt2yPr); // GeV^2
+        double ff1 = calcNormFF(x1, qt1xPr, qt1yPr);                                              // GeV^-2
+        double ff2 = calcNormFF(x2, qt2xPr, qt2yPr);                                              // GeV^-2
+        sum_phi[spState] = weights8[iphi] * ff1 * ff2 * tfGAA * amps;                             // GeV^-2 * fm^2
+      }
+    }
+    sum_phi *= qt * (qth - qtl) * M_PI; // fm^2
+    sum += sum_phi;
+    sum_phi *= 0;
+  }
+  spAmplitudes = sum;
+  spAmplitudes *= -1. / 4. / M_PI / M_PI;
+  // fm^2 //
+}
+
+double UpcGenerator::scrElCrossSectionM(double s, double x1, double x2,
+                                        double kt1x, double kt1y,
+                                        double kt2x, double kt2y)
+{
+  // arrays of amplitudes for each lepton pair spin state
+  valarray<complex<double>> scrAmps(4);
+  valarray<complex<double>> unscAmps(4);
+  valarray<complex<double>> totAmps(4);
+  double lzmin = -1;
+  double lzmax = 1;
+  int lnz = 200;
+  double dz = (lzmax - lzmin) / lnz;
+  auto* totAmpsSqZ = new double[lnz];
+  // calculating sum of squared amplitudes for each z
+  // and integrating over z = cos(th)
+  for (int iz = 0; iz < lnz; iz++) {
+    double z = lzmin + dz * iz;
+    calcScreenedAmp(s, z, x1, x2, kt1x, kt1y, kt2x, kt2y, scrAmps); // fm^2
+    scrAmps /= hc * hc;                                             // fm^2 -> GeV^-2
+    for (int spState = 0; spState < 3; spState++) {
+      unscAmps[spState] = calcSpinAmplitudes(s, z, spState, kt1x, kt1y, kt2x, kt2y); // GeV^2
+    }
+    double ff1 = calcNormFF(x1, kt1x, kt1y); // GeV^-2
+    double ff2 = calcNormFF(x2, kt2x, kt2y); // GeV^-2
+    unscAmps *= ff1 * ff2;                   // GeV^2 -> GeV^-2
+    totAmps = unscAmps + scrAmps; // GeV^-2 + GeV^-2
+    for (int spState = 0; spState < 3; spState++) {
+      totAmpsSqZ[iz] += abs(totAmps[spState]) * abs(totAmps[spState]);
+    }
+  }
+  double cs = simpson(lnz, totAmpsSqZ, dz);
+  delete[] totAmpsSqZ;
+  return cs;
+  // GeV^-2 //
+}
+
+double UpcGenerator::scrNucCrossSectionYM(double y, double m)
+{
+  double k1 = m / 2 * exp(y);
+  double k2 = m / 2 * exp(-y);
+  double s = m * m;
+  double x1 = k1 / g1 / mProt;
+  double x2 = k2 / g2 / mProt;
+  const int nphi = 8;
+  const double ktmin = 0; // GeV
+  const double ktmax = 1; // GeV
+  const double nkt = 200;
+  const double dkt = (ktmax - ktmin) / nkt;
+  double cs = 0;
+  for (int ikt1 = 0; ikt1 < nkt; ikt1++) {
+    double kt1 = ktmin + ikt1 * dkt;
+    for (int ikt2 = 0; ikt2 < nkt; ikt2++) {
+      double kt2 = ktmin + ikt2 * dkt;
+      double cs_phi = 0;
+      for (int iphi = 0; iphi < nphi; iphi++) {
+        double phi = 2 * M_PI * (abscissas8[iphi] + 1); // integrating from 0 to 2pi
+        double kt1x = kt1;                              // kt1 * cos(0)
+        double kt1y = 0;                                // kt1 * sin(0)
+        double kt2x = kt2 * cos(phi);
+        double kt2y = kt2 * sin(phi);
+        double item = weights8[iphi] * scrElCrossSectionM(s, x1, x2, kt1x, kt1y, kt2x, kt2y);
+        cs_phi += item; // GeV^-2
+      }
+      cs += cs_phi;
+    }
+  }
+  double fac = M_PI * alpha * alpha * hc * hc / s; // fm^2
+  cs *= dkt * dkt * fac;                           // fm^2
+  cs *= 1e7;                                       // 1 fm^2 = 10^7 nb
+  return cs;
+  // nb //
 }
 
 double UpcGenerator::fluxPoint(const double b, const double k, const double g)
@@ -417,11 +640,11 @@ double UpcGenerator::D2LDMDY(double M, double Y, TF1* fFluxFormInt, const TGraph
       double b2 = (b2h + b2l) / 2.;
       double sum_phi = 0.;
       for (int k = 0; k < ngi; k++) {
-        if (abscissas[k] < 0) {
+        if (abscissas10[k] < 0) {
           continue;
         }
-        double b = TMath::Sqrt(b1 * b1 + b2 * b2 + 2. * b1 * b2 * TMath::Cos(M_PI * abscissas[k]));
-        sum_phi += (b < 20.) ? (weights[k] * gGAA->Eval(b) * 2) : (weights[k] * 2.);
+        double b = TMath::Sqrt(b1 * b1 + b2 * b2 + 2. * b1 * b2 * TMath::Cos(M_PI * abscissas10[k]));
+        sum_phi += (b < 20.) ? (weights10[k] * gGAA->Eval(b) * 2) : (weights10[k] * 2.);
       }
       sum_b2 += flux[j] * M_PI * sum_phi * b2 * (b2h - b2l);
     }
@@ -431,6 +654,7 @@ double UpcGenerator::D2LDMDY(double M, double Y, TF1* fFluxFormInt, const TGraph
   return D2LDMDYx;
 }
 
+// unpolarized elementary cross section
 double UpcGenerator::crossSectionMZ(double s, double z)
 {
   double k = TMath::Sqrt(s / 2.);              // photon/lepton energy in cm system in GeV
@@ -491,72 +715,63 @@ void UpcGenerator::fillCrossSectionMZ(TH2D* hCrossSectionMZ,
 void UpcGenerator::fillCrossSectionM(TH1D* hCrossSectionM,
                                      double mmin, double mmax, int nm)
 {
-  double m;
   double dm = (mmax - mmin) / nm;
-  double cs;
   for (int im = 0; im <= nm; im++) {
-    m = mmin + dm * im;
-    cs = crossSectionM(m);
+    double m = mmin + dm * im;
+    double cs = crossSectionM(m);
     hCrossSectionM->SetBinContent(im, cs);
   }
   double scalingFactor = hc * hc * 1e7; // to [nb]
   hCrossSectionM->Scale(scalingFactor);
 }
 
-void UpcGenerator::nuclearCrossSectionYM(TH2D* hCrossSectionYM)
+void UpcGenerator::prepareGAA()
 {
-  PLOG_INFO << "Calculating nuclear cross section for a_lep = " << aLep;
+  double ssm = pow(sqrts, 2) / pow(2 * mProt + 2.1206, 2);
+  double csNN = 0.1 * (34.41 + 0.2720 * pow(log(ssm), 2) + 13.07 * pow(ssm, -0.4473) - 7.394 * pow(ssm, -0.5486)); // PDG 2016
+  // calculate rho and TA
+  double TAb[nb];
+  for (int ib = 0; ib < nb; ib++) {
+    double b = ib * db;
+    for (int iz = 0; iz < nb; iz++) {
+      double z = iz * db;
+      double r = TMath::Sqrt(b * b + z * z);
+      rho[ib][iz] = rho0 / (1 + exp((r - R) / a));
+    }
+    TA[ib] = 2 * simpson(nb, rho[ib], db);
+    TAb[ib] = TA[ib] * b;
+    vb[ib] = b;
+  }
+  auto* gTA = new TGraph(nb, vb, TA);
 
-  double dy = (ymax - ymin) / (ny - 1);
-  double dm = (mmax - mmin) / (nm - 1);
+  // calculate GAA
+  for (int ib = 0; ib < nb; ib++) {
+    double b = ib * db;
+    for (int is = 0; is < nb; is++) {
+      double s = is * db;
+      double sum_phi = 0;
+      for (int k = 0; k < ngi; k++) {
+        if (abscissas10[k] < 0)
+          continue;
+        double r = TMath::Sqrt(b * b + s * s + 2 * b * s * TMath::Cos(M_PI * abscissas10[k]));
+        sum_phi += 2 * M_PI * weights10[k] * gTA->Eval(r);
+      }
+      vs[is] = 2 * s * gTA->Eval(s) * sum_phi;
+    }
+    vGAA[ib] = exp(-csNN * simpson(nb, vs, db));
+  }
+}
 
+void UpcGenerator::prepareTwoPhotonLumi()
+{
   // calculating two-photon luminosity (if needed)
   // -----------------------------------------------------------------------
-
   if (!gSystem->AccessPathName("hD2LDMDY.root")) {
     PLOG_INFO << "Found precalculated 2D luminosity";
   } else {
     PLOG_INFO << "Precalculated 2D luminosity is not found. Starting all over...";
-
-    // -----------------------------------------------------------------------
-
-    double ssm = pow(sqrts, 2) / pow(2 * mProt + 2.1206, 2);
-    double csNN = 0.1 * (34.41 + 0.2720 * pow(log(ssm), 2) + 13.07 * pow(ssm, -0.4473) - 7.394 * pow(ssm, -0.5486)); // PDG 2016
-
-    // calculate rho and TA
-    double b, z, r, s, sum_phi;
-    int ib, is, iz, k;
-    double TAb[nb];
-    for (ib = 0; ib < nb; ib++) {
-      b = ib * db;
-      for (iz = 0; iz < nb; iz++) {
-        z = iz * db;
-        r = TMath::Sqrt(b * b + z * z);
-        rho[ib][iz] = rho0 / (1 + exp((r - R) / a));
-      }
-      TA[ib] = 2 * simpson(nb, rho[ib], db);
-      TAb[ib] = TA[ib] * b;
-      vb[ib] = b;
-    }
-    auto* gTA = new TGraph(nb, vb, TA);
-
-    // calculate GAA
-    for (ib = 0; ib < nb; ib++) {
-      b = ib * db;
-      for (is = 0; is < nb; is++) {
-        s = is * db;
-        sum_phi = 0;
-        for (k = 0; k < ngi; k++) {
-          if (abscissas[k] < 0)
-            continue;
-          r = TMath::Sqrt(b * b + s * s + 2 * b * s * TMath::Cos(M_PI * abscissas[k]));
-          sum_phi += 2 * M_PI * weights[k] * gTA->Eval(r);
-        }
-        vs[is] = 2 * s * gTA->Eval(s) * sum_phi;
-      }
-      vGAA[ib] = exp(-csNN * simpson(nb, vs, db));
-    }
-
+    double dy = (ymax - ymin) / (ny - 1);
+    double dm = (mmax - mmin) / (nm - 1);
     // using ether parallel or serial implementation
 #ifdef USE_OPENMP
     auto* f2DLumi = new TFile("hD2LDMDY.root", "recreate");
@@ -568,7 +783,7 @@ void UpcGenerator::nuclearCrossSectionYM(TH2D* hCrossSectionYM)
     omp_set_num_threads(numThreads);
 #pragma omp parallel default(none)           \
   shared(hD2LDMDY, progress) private(im, iy) \
-    firstprivate(nb, vb, total, numThreads, dm, dy, ymin, ymax, mmin, mmax, nm, ny, abscissas, weights, vGAA)
+    firstprivate(nb, vb, total, numThreads, dm, dy, ymin, ymax, mmin, mmax, nm, ny, abscissas10, weights10, vGAA)
     {
       auto* fFluxFormInt = new TF1(Form("fFluxFormInt_private_%d", omp_get_thread_num()), fluxFormInt, 0, 10, 3);
       auto* gGAA = new TGraph(nb, vb, vGAA);
@@ -577,10 +792,10 @@ void UpcGenerator::nuclearCrossSectionYM(TH2D* hCrossSectionYM)
       int lowM = nm * threadNum / numThreads;
       int highM = nm * (threadNum + 1) / numThreads;
       for (im = lowM; im < highM; im++) {
-        double M = mmin + dm * im;
+        double m = mmin + dm * im;
         for (iy = 0; iy < ny; iy++) {
           double y = ymin + dy * iy;
-          double item = D2LDMDY(M, y, fFluxFormInt, gGAA);
+          double item = D2LDMDY(m, y, fFluxFormInt, gGAA);
           hD2LDMDY_private->SetBinContent(im, iy, item * dm * dy);
           progress++;
         }
@@ -616,32 +831,45 @@ void UpcGenerator::nuclearCrossSectionYM(TH2D* hCrossSectionYM)
 
     PLOG_INFO << "Two-photon luminosity was written to 'hD2LDMDY.root'";
   }
+}
 
-  // calculating nuclear cross section
-  // -----------------------------------------------------------------------
+void UpcGenerator::nuclearCrossSectionYM(TH2D* hCrossSectionYM)
+{
+  PLOG_INFO << "Calculating nuclear cross section for a_lep = " << aLep;
 
-  // loading pre-cached two-photon luminosity
-  auto* f2DLumi = new TFile("hD2LDMDY.root", "r");
-  auto* hD2LDMDY = (TH2D*)f2DLumi->Get("hD2LDMDY");
+  double dy = (ymax - ymin) / (ny - 1);
+  double dm = (mmax - mmin) / (nm - 1);
 
-  // calculating total elementary cross section
-  PLOG_INFO << "Calculating total elementary cross section...";
-  auto* hCrossSectionM = new TH1D("hCrossSectionM", ";m [gev]; cs [nb];",
-                                  nm, mmin, mmax);
-  fillCrossSectionM(hCrossSectionM, mmin, mmax, nm);
+  prepareGAA();
+  TH2D* hD2LDMDY;
 
-  PLOG_INFO << "Calculating total elementary cross section...Done!";
-
-  auto* hCrossSectionM_ax = hCrossSectionM->GetXaxis();
+  // don't need to prepare luminosity if using screened amplitude
+  if (!doScreened) {
+    prepareTwoPhotonLumi();
+    // loading pre-cached two-photon luminosity
+    auto* f2DLumi = new TFile("hD2LDMDY.root", "r");
+    hD2LDMDY = (TH2D*)f2DLumi->Get("hD2LDMDY");
+  } else {
+    PLOG_INFO << "Using screened amplitude, skipping 2D luminosity preparation...";
+  }
 
   // calculating nuclear cross section
   PLOG_INFO << "Calculating nuclear cross section...";
+  int progress = 0;
+  int total = nm * ny;
   double cs[nm][ny];
   for (int im = 0; im < nm; im++) {
-    double M = mmin + dm * im;
+    double m = mmin + dm * im;
     for (int iy = 0; iy < ny; iy++) {
-      double csItem = hCrossSectionM->GetBinContent(hCrossSectionM_ax->FindBin(M));
-      cs[im][iy] = csItem * 1e-6 * hD2LDMDY->GetBinContent(im, iy);
+      if (!doScreened) {
+        cs[im][iy] = crossSectionM(m) * hD2LDMDY->GetBinContent(im, iy);
+      } else {
+        double y = ymin + dy * iy;
+        cs[im][iy] = scrNucCrossSectionYM(y, m);
+      }
+      progress++;
+      double progressBar = 100. *  (double) progress / total;
+      PLOG_INFO << "Calculating 2D luminosity grid..." << fixed << setprecision(2) << progressBar << "%";
     }
   }
   PLOG_INFO << "Calculating nuclear cross section...Done!";
@@ -656,7 +884,9 @@ void UpcGenerator::nuclearCrossSectionYM(TH2D* hCrossSectionYM)
     }
   }
 
-  PLOG_INFO << "Total nuclear cross section = " << cssum << " mb";
+  hCrossSectionYM->Scale(1e-6); // nb -> mb
+
+  PLOG_INFO << "Total nuclear cross section = " << cssum * 1e-6 << " mb";
 }
 
 // Ref.: S.R.Klein, J.Nystrand, PRC 60 014903, 1999
@@ -726,10 +956,10 @@ void UpcGenerator::getPairMomentum(double mPair, double yPair, TLorentzVector& p
     double k2 = mPair / 2 * exp(-yPair);
     double angle1 = gRandom->Uniform(0, 2 * M_PI);
     double angle2 = gRandom->Uniform(0, 2 * M_PI);
-    double pt1 = getPhotonPt(k1);
-    double pt2 = getPhotonPt(k2);
-    double px = pt1 * TMath::Cos(angle1) + pt2 * TMath::Cos(angle2);
-    double py = pt1 * TMath::Sin(angle1) + pt2 * TMath::Sin(angle2);
+    double kt1 = getPhotonPt(k1);
+    double kt2 = getPhotonPt(k2);
+    double px = kt1 * TMath::Cos(angle1) + kt2 * TMath::Cos(angle2);
+    double py = kt1 * TMath::Sin(angle1) + kt2 * TMath::Sin(angle2);
     double pt = TMath::Sqrt(px * px + py * py);
     double mtPair = TMath::Sqrt(mPair * mPair + pt * pt);
     double pz = mtPair * TMath::SinH(yPair);
@@ -740,7 +970,7 @@ void UpcGenerator::getPairMomentum(double mPair, double yPair, TLorentzVector& p
 
 void UpcGenerator::generateEvents()
 {
-  // calculating elementary cross section in WZ space
+  // calculating elementary cross section in MZ space
   // -----------------------------------------------------------------------
   PLOG_INFO << "Calculating elementary cross section...";
 

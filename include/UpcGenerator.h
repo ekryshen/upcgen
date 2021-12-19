@@ -49,7 +49,9 @@
 #include "plog/Initializers/RollingFileInitializer.h"
 #include "plog/Log.h"
 
+#include <complex>
 #include <fstream>
+#include <valarray>
 
 #ifdef USE_HEPMC
 #include "HepMC3/GenEvent.h"
@@ -138,17 +140,47 @@ class UpcGenerator
   // ----------------------------------------------------------------------
 
   // Simpson integrator
-  static double simpson(int n, double* v, double h);
+  static double simpson(int n, const double* v, double h);
 
   // Woods-Saxon rho0 from normalization
   double calcWSRho();
 
+  // unpolarized helicity amplitudes for gamma gamma -> ll
+  // fills array of amplitudes for all photon and lepton helicities
+  void calcAmplitudes(double s, double z,
+                      valarray<double>& amplitudes);
+
+  // calculate 'sum' of amplitudes for each pair of lepton spins
+  complex<double> calcSpinAmplitudes(double s, double z, int spState,
+                                     double qt1xPr, double qt1yPr,
+                                     double qt2xPr, double qt2yPr);
+
+  // 'Fourier' transform of G_AA
+  double calcGAATransform(double kt);
+
+  // normalization factor
+  double calcNormFF(double x, double qtxPr, double qtyPr);
+
+  // screened amplitude
+  void calcScreenedAmp(double s, double z, double x1, double x2,
+                       double kt1x, double kt1y,
+                       double kt2x, double kt2y,
+                       valarray<complex<double>>& spAmplitudes);
+
+  // screened elementary cross section
+  double scrElCrossSectionM(double s, double x1, double x2,
+                            double kt1x, double kt1y,
+                            double kt2x, double kt2y);
+
+  // screened nuclear cross section
+  double scrNucCrossSectionYM(double y, double m);
+
   // photon fluxes
-  double fluxPoint(const double b, const double k, const double g);
+  double fluxPoint(double b, double k, double g);
 
   static double fluxFormInt(double* x, double* par);
 
-  double fluxForm(const double b, const double k, const double g, TF1* fFluxForm);
+  double fluxForm(double b, double k, double g, TF1* fFluxForm);
 
   // two-photon luminosity
   double D2LDMDY(double M, double Y, TF1* fFluxForm, const TGraph* gGAA);
@@ -168,9 +200,18 @@ class UpcGenerator
   void fillCrossSectionM(TH1D* hCrossSectionM,
                          double mmin, double mmax, int nm);
 
+  // prepare G_AA
+  void prepareGAA();
+
+  // prepare two photon luminosity, cache to file
+  void prepareTwoPhotonLumi();
+
   // function to calculate nuclear cross section
   // using 2D elementary cross section and 2-gamma luminosity
   void nuclearCrossSectionYM(TH2D* hCrossSectionYM);
+
+  // screened nuclear cross section
+  void scrNuclearCrossSection(TH2D* hCrossSectionYM);
 
   // nuclear form factor for momentum transfer q
   static double nucFormFactor(double t);
@@ -192,6 +233,7 @@ class UpcGenerator
   const double alpha{1.0 / 137.035999074};  // fine structure constant
   constexpr static double hc{0.1973269718}; // scaling factor
   const double mProt{0.9382720813};         // proton mass
+  const double mNeut{0.9395654205};         // neutron mass
 
   // Woods-Saxon parameters
   static double rho0; // fm-3
@@ -201,6 +243,7 @@ class UpcGenerator
   // parameters of the nucleus
   static double Z;
   double A{208};
+  double mN;
 
   // beam parameters
   double sqrts{5020};
@@ -211,12 +254,18 @@ class UpcGenerator
   // since cos is symmetric around 0 we only need 5
   // of the points in the gaussian integration.
   static const int ngi = 5;
-  double weights[ngi]{0.2955242247147529, 0.2692667193099963,
-                      0.2190863625159820, 0.1494513491505806,
-                      0.0666713443086881};
-  double abscissas[ngi]{0.1488743389816312, 0.4333953941292472,
-                        0.6794095682990244, 0.8650633666889845,
-                        0.9739065285171717};
+  const double weights10[ngi]{0.2955242247147529, 0.2692667193099963,
+                              0.2190863625159820, 0.1494513491505806,
+                              0.0666713443086881};
+  const double abscissas10[ngi]{0.1488743389816312, 0.4333953941292472,
+                                0.6794095682990244, 0.8650633666889845,
+                                0.9739065285171717};
+
+  // Gauss-Legendre quadrature with 8 points
+  const double weights8[8]{0.1012285362903763, 0.2223810344533745, 0.3137066458778873, 0.3626837833783620,
+                           0.3626837833783620, 0.3137066458778873, 0.2223810344533745, 0.1012285362903763};
+  const double abscissas8[8]{-0.9602898564975363, -0.7966664774136267, -0.5255324099163290, -0.1834346424956498,
+                             0.1834346424956498, 0.5255324099163290, 0.7966664774136267, 0.9602898564975363};
 
   // photon luminosity calculation parameters
   const int nb1{120};
@@ -253,6 +302,7 @@ class UpcGenerator
   int nEvents{1000};
   bool isPoint{true}; // flux calculation parameter
   bool useNonzeroGamPt{true};
+  bool doScreened{false};
   static std::map<int, double> lepMassMap;
 
   // parameters dictionary
@@ -279,6 +329,7 @@ class UpcGenerator
     string inBinsY{"BINS_Y"};
     string inFluxPoint{"FLUX_POINT"};
     string inNonzeroGamPt{"NON_ZERO_GAM_PT"};
+    string inCalcScreened{"DO_SCREENED"};
     string inPythiaVer{"PYTHIA_VERSION"};
     string inPythia8FSR{"PYTHIA8_FSR"};
     string inPythia8Decays{"PYTHIA8_DECAYS"};
